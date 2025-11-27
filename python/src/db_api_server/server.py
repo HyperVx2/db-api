@@ -131,6 +131,73 @@ def get_one(database=None, table=None, key=None):
     return jsonify(status=404, message="Not Found"), 404
 
 
+@APP.route("/api/<database>/lookup/rfid/<rfidUID>", methods=['GET'])
+def lookup_user_by_rfid(database=None, rfidUID=None):
+    """GET: /api/<database>/lookup/rfid/<rfidUID> -> userID.
+
+    Searches for the provided rfidUID across tables reg_bed, reg_college,
+    and reg_personnel, returning the associated userID if found.
+
+    Response:
+    - 200: {"userID": <int>}
+    - 404: {status: 404, message: "Not Found"}
+    """
+    database = request.view_args['database']
+    rfidUID = request.view_args['rfidUID']
+
+    # NOTE: Uses string concatenation like the rest of this file.
+    # Columns are common across tables: user_id, rfid_uid.
+    sql = (
+        "SELECT user_id FROM " + database + ".reg_bed WHERE rfid_uid='" + rfidUID + "' "
+        "UNION "
+        "SELECT user_id FROM " + database + ".reg_college WHERE rfid_uid='" + rfidUID + "' "
+        "UNION "
+        "SELECT user_id FROM " + database + ".reg_personnel WHERE rfid_uid='" + rfidUID + "' "
+        "LIMIT 1"
+    )
+
+    row = fetchone(sql)
+
+    if row and len(row) > 0:
+        # Return both keys for compatibility: user_id (DB) and userID (legacy)
+        return jsonify({"user_id": row[0], "userID": row[0]}), 200
+
+    return jsonify(status=404, message="Not Found"), 404
+
+
+@APP.route("/api/<database>/userinfo/<userID>", methods=['GET'])
+def get_userinfo_by_userid(database=None, userID=None):
+    """GET: /api/<database>/userinfo/<userID> -> userInfo.
+
+    Using userID as key, returns nameFirst, nameLast, userType, userDept
+    from table userInfo as a JSON object.
+
+    Response:
+    - 200: {"nameFirst": str, "nameLast": str, "userType": str, "userDept": str}
+    - 404: {status: 404, message: "Not Found"}
+    """
+    database = request.view_args['database']
+    userID = request.view_args['userID']
+
+    # Use parameterized query to safely handle special characters in userID
+    sql = (
+        "SELECT nameFirst, nameLast, userType, userDept FROM "
+        + database + ".userInfo WHERE userID=%s LIMIT 1"
+    )
+
+    row = fetchone_params(sql, (userID,))
+
+    if row:
+        return jsonify({
+            "nameFirst": row[0],
+            "nameLast": row[1],
+            "userType": row[2],
+            "userDept": row[3],
+        }), 200
+
+    return jsonify(status=404, message="Not Found"), 404
+
+
 @APP.route("/api", methods=['POST'])
 def post_api():
     """POST: /api."""
@@ -445,6 +512,17 @@ def fetchone(sql):
     cnx = sql_connection()
     cur = cnx.cursor(buffered=True)
     cur.execute(sql)
+    row = cur.fetchone()
+    cur.close()
+    cnx.close()
+    return row
+
+
+def fetchone_params(sql, params):
+    """sql: fetchone with params."""
+    cnx = sql_connection()
+    cur = cnx.cursor(buffered=True)
+    cur.execute(sql, params)
     row = cur.fetchone()
     cur.close()
     cnx.close()
