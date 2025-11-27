@@ -198,6 +198,36 @@ def get_userinfo_by_userid(database=None, userID=None):
     return jsonify(status=404, message="Not Found"), 404
 
 
+@APP.route("/api/<database>/rfid/users", methods=['GET'])
+def get_rfid_users(database=None):
+    """GET: /api/<database>/rfid/users -> list of user_id and rfid_uid.
+
+    Returns a list of all users with their RFID UIDs from tables
+    reg_bed, reg_college, and reg_personnel.
+
+    Response:
+    - 200: [{"user_id": str, "rfid_uid": str}, ...]
+    - 404: {status: 404, message: "Not Found"}
+    """
+    database = request.view_args['database']
+
+    sql = (
+        "SELECT user_id, rfid_uid FROM " + database + ".reg_bed "
+        "UNION "
+        "SELECT user_id, rfid_uid FROM " + database + ".reg_college "
+        "UNION "
+        "SELECT user_id, rfid_uid FROM " + database + ".reg_personnel"
+    )
+
+    rows = fetchall(sql)
+
+    if rows:
+        result = [{"user_id": row[0], "rfid_uid": row[1]} for row in rows]
+        return jsonify(result), 200
+
+    return jsonify(status=404, message="Not Found"), 404
+
+
 @APP.route("/api", methods=['POST'])
 def post_api():
     """POST: /api."""
