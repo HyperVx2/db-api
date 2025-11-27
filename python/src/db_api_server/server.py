@@ -140,100 +140,48 @@ def get_one(database=None, table=None, key=None):
 
     return jsonify(status=404, message="Not Found"), 404
 
+@APP.route("/api/<database>/rfid/users", methods=['GET'])
+def get_rfid_users(database=None):
+    """GET: /api/<database>/rfid/users -> list of user_id, rfid_uid, and type.
 
-@APP.route("/api/<database>/lookup/rfid/<rfidUID>", methods=['GET'])
-def lookup_user_by_rfid(database=None, rfidUID=None):
-    """GET: /api/<database>/lookup/rfid/<rfidUID> -> userID.
-
-    Searches for the provided rfidUID across tables reg_bed, reg_college,
-    and reg_personnel, returning the associated userID if found.
+    Returns a list of all users with their RFID UIDs from user_rfid table.
 
     Response:
-    - 200: {"userID": <int>}
+    - 200: [{"user_id": str, "rfid_uid": str, "type": str}, ...]
+    - 404: {status: 404, message: "Not Found"}
+    """
+    database = request.view_args['database']
+
+    sql = "SELECT user_id, rfid_uid, type FROM " + database + ".user_rfid"
+
+    rows = fetchall(sql)
+
+    if rows:
+        result = [{"user_id": row[0], "rfid_uid": row[1], "type": row[2]} for row in rows]
+        return jsonify(result), 200
+
+    return jsonify(status=404, message="Not Found"), 404
+
+
+@APP.route("/api/<database>/rfid/<rfidUID>", methods=['GET'])
+def get_user_by_rfid(database=None, rfidUID=None):
+    """GET: /api/<database>/rfid/<rfidUID> -> user by RFID UID.
+
+    Returns the complete user record from user_rfid table by RFID UID.
+
+    Response:
+    - 200: {"user_id": str, "rfid_uid": str, "type": str}
     - 404: {status: 404, message: "Not Found"}
     """
     database = request.view_args['database']
     rfidUID = request.view_args['rfidUID']
 
-    # NOTE: Uses string concatenation like the rest of this file.
-    # Columns are common across tables: user_id, rfid_uid.
-    sql = (
-        "SELECT user_id FROM " + database + ".reg_bed WHERE rfid_uid='" + rfidUID + "' "
-        "UNION "
-        "SELECT user_id FROM " + database + ".reg_college WHERE rfid_uid='" + rfidUID + "' "
-        "UNION "
-        "SELECT user_id FROM " + database + ".reg_personnel WHERE rfid_uid='" + rfidUID + "' "
-        "LIMIT 1"
-    )
+    sql = "SELECT user_id, rfid_uid, type FROM " + database + ".user_rfid WHERE rfid_uid=%s LIMIT 1"
 
-    row = fetchone(sql)
-
-    if row and len(row) > 0:
-        # Return both keys for compatibility: user_id (DB) and userID (legacy)
-        return jsonify({"user_id": row[0], "userID": row[0]}), 200
-
-    return jsonify(status=404, message="Not Found"), 404
-
-
-@APP.route("/api/<database>/userinfo/<userID>", methods=['GET'])
-def get_userinfo_by_userid(database=None, userID=None):
-    """GET: /api/<database>/userinfo/<userID> -> userInfo.
-
-    Using userID as key, returns nameFirst, nameLast, userType, userDept
-    from table userInfo as a JSON object.
-
-    Response:
-    - 200: {"nameFirst": str, "nameLast": str, "userType": str, "userDept": str}
-    - 404: {status: 404, message: "Not Found"}
-    """
-    database = request.view_args['database']
-    userID = request.view_args['userID']
-
-    # Use parameterized query to safely handle special characters in userID
-    sql = (
-        "SELECT nameFirst, nameLast, userType, userDept FROM "
-        + database + ".userInfo WHERE userID=%s LIMIT 1"
-    )
-
-    row = fetchone_params(sql, (userID,))
+    row = fetchone_params(sql, (rfidUID,))
 
     if row:
-        return jsonify({
-            "nameFirst": row[0],
-            "nameLast": row[1],
-            "userType": row[2],
-            "userDept": row[3],
-        }), 200
-
-    return jsonify(status=404, message="Not Found"), 404
-
-
-@APP.route("/api/<database>/rfid/users", methods=['GET'])
-def get_rfid_users(database=None):
-    """GET: /api/<database>/rfid/users -> list of user_id and rfid_uid.
-
-    Returns a list of all users with their RFID UIDs from tables
-    reg_bed, reg_college, and reg_personnel.
-
-    Response:
-    - 200: [{"user_id": str, "rfid_uid": str}, ...]
-    - 404: {status: 404, message: "Not Found"}
-    """
-    database = request.view_args['database']
-
-    sql = (
-        "SELECT user_id, rfid_uid FROM " + database + ".reg_bed "
-        "UNION "
-        "SELECT user_id, rfid_uid FROM " + database + ".reg_college "
-        "UNION "
-        "SELECT user_id, rfid_uid FROM " + database + ".reg_personnel"
-    )
-
-    rows = fetchall(sql)
-
-    if rows:
-        result = [{"user_id": row[0], "rfid_uid": row[1]} for row in rows]
-        return jsonify(result), 200
+        return jsonify({"user_id": row[0], "rfid_uid": row[1], "type": row[2]}), 200
 
     return jsonify(status=404, message="Not Found"), 404
 
@@ -466,6 +414,67 @@ def get_google_user_photo(database=None, userKey=None):
         )
     
     return jsonify(status=404, message="Photo not found"), 404
+
+
+@APP.route("/api/<database>/attendance/log", methods=['POST'])
+def log_user_attendance(database=None):
+    """POST: /api/<database>/attendance/log.
+    
+    Log user attendance/login.
+    
+    Request Body (JSON):
+    {
+        "userID": "string",
+        "primaryEmail": "string"
+    }
+    
+    Response:
+    - 201: {"status": 201, "message": "Attendance logged", "id": int}
+    - 400: {"status": 400, "message": "Missing required fields"}
+    - 500: {"status": 500, "message": error message}
+    """
+    database = request.view_args['database']
+    
+    if not request.is_json:
+        return jsonify(status=400, message="Content-Type must be application/json"), 400
+    
+    data = request.get_json()
+    
+    user_id = data.get('userID')
+    primary_email = data.get('primaryEmail')
+    
+    if not user_id or not primary_email:
+        return jsonify(status=400, 
+                      message="Missing required fields: userID and primaryEmail"), 400
+    
+    try:
+        # Get current datetime
+        login_time = datetime.now()
+        
+        # Insert attendance record
+        cnx = sql_connection()
+        cur = cnx.cursor(buffered=True)
+        
+        sql = (
+            "INSERT INTO " + database + ".user_attendance "
+            "(user_id, primary_email, login_time) VALUES (%s, %s, %s)"
+        )
+        
+        cur.execute(sql, (user_id, primary_email, login_time))
+        cnx.commit()
+        
+        attendance_id = cur.lastrowid
+        
+        cur.close()
+        cnx.close()
+        
+        return jsonify(status=201,
+                      message="Attendance logged",
+                      id=attendance_id,
+                      loginTime=login_time.isoformat()), 201
+    
+    except Exception as e:
+        return jsonify(status=500, message=str(e)), 500
 
 
 @APP.route("/api", methods=['POST'])
