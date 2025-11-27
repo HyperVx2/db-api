@@ -10,15 +10,25 @@ __version__ = '1.0.6'
 import base64
 import decimal
 import json
+from datetime import datetime
 
 import flask.json
 from flask import Flask
 from flask import request
 from flask import jsonify
+from flask import send_file
 from werkzeug.exceptions import HTTPException
 from flask_cors import CORS
+from io import BytesIO
 
 import mysql.connector
+
+try:
+    from .google_directory import create_client_from_env
+    GOOGLE_AVAILABLE = True
+except ImportError:
+    GOOGLE_AVAILABLE = False
+    create_client_from_env = None
 
 
 class AppJSONEncoder(json.JSONEncoder):
@@ -226,6 +236,236 @@ def get_rfid_users(database=None):
         return jsonify(result), 200
 
     return jsonify(status=404, message="Not Found"), 404
+
+
+@APP.route("/api/<database>/google/sync", methods=['POST'])
+def sync_google_users(database=None):
+    """POST: /api/<database>/google/sync.
+    
+    Sync all Google Workspace users to database.
+    
+    Response:
+    - 201: {"status": 201, "message": "Sync completed", "users_synced": int}
+    - 503: {"status": 503, "message": "Google API not available"}
+    - 500: {"status": 500, "message": error message}
+    """
+    database = request.view_args['database']
+    
+    if not GOOGLE_AVAILABLE:
+        return jsonify(status=503, message="Google API not configured"), 503
+    
+    try:
+        google_client = create_client_from_env()
+        if not google_client:
+            return jsonify(status=503, 
+                         message="Google credentials not configured"), 503
+        
+        # Log sync start
+        log_id = log_sync_start(database, 'full')
+        
+        # Fetch all users from Google
+        users = google_client.list_all_users()
+        
+        # Sync users to database
+        users_synced = 0
+        for user in users:
+            if sync_user_to_db(database, user):
+                users_synced += 1
+        
+        # Log sync completion
+        log_sync_complete(database, log_id, users_synced, 0)
+        
+        return jsonify(status=201,
+                      message="Sync completed",
+                      users_synced=users_synced), 201
+                      
+    except Exception as e:
+        log_sync_failed(database, log_id, str(e))
+        return jsonify(status=500, message=str(e)), 500
+
+
+@APP.route("/api/<database>/google/sync/photos", methods=['POST'])
+def sync_google_photos(database=None):
+    """POST: /api/<database>/google/sync/photos.
+    
+    Sync all Google Workspace user photos to database.
+    
+    Response:
+    - 201: {"status": 201, "message": "Photo sync completed", "photos_synced": int}
+    - 503: {"status": 503, "message": "Google API not available"}
+    - 500: {"status": 500, "message": error message}
+    """
+    database = request.view_args['database']
+    
+    if not GOOGLE_AVAILABLE:
+        return jsonify(status=503, message="Google API not configured"), 503
+    
+    try:
+        google_client = create_client_from_env()
+        if not google_client:
+            return jsonify(status=503,
+                         message="Google credentials not configured"), 503
+        
+        # Log sync start
+        log_id = log_sync_start(database, 'photo')
+        
+        # Get all user IDs from database
+        sql = "SELECT id, primary_email FROM " + database + ".google_users"
+        users = fetchall(sql)
+        
+        photos_synced = 0
+        for user_row in users:
+            user_id = user_row[0]
+            email = user_row[1]
+            
+            # Fetch photo from Google
+            photo_result = google_client.get_user_photo(email)
+            if photo_result:
+                photo_data, mime_type = photo_result
+                if sync_photo_to_db(database, user_id, photo_data, mime_type):
+                    photos_synced += 1
+        
+        # Log sync completion
+        log_sync_complete(database, log_id, 0, photos_synced)
+        
+        return jsonify(status=201,
+                      message="Photo sync completed",
+                      photos_synced=photos_synced), 201
+                      
+    except Exception as e:
+        log_sync_failed(database, log_id, str(e))
+        return jsonify(status=500, message=str(e)), 500
+
+
+@APP.route("/api/<database>/google/users", methods=['GET'])
+def get_google_users(database=None):
+    """GET: /api/<database>/google/users.
+    
+    Get all synced Google Workspace users from database.
+    Query params: limit (optional)
+    
+    Response:
+    - 200: [{user fields}, ...]
+    - 404: {"status": 404, "message": "Not Found"}
+    """
+    database = request.view_args['database']
+    limit = request.args.get("limit", None)
+    
+    sql = (
+        "SELECT id, primary_email, given_name, family_name, external_id, "
+        "department, org_description, suspended, is_admin, last_login_time, synced_at "
+        "FROM " + database + ".google_users ORDER BY primary_email"
+    )
+    
+    if limit:
+        sql += " LIMIT " + limit
+    
+    rows = fetchall(sql)
+    
+    if rows:
+        result = []
+        for row in rows:
+            result.append({
+                "id": row[0],
+                "primaryEmail": row[1],
+                "givenName": row[2],
+                "familyName": row[3],
+                "externalId": row[4],
+                "department": row[5],
+                "orgDescription": row[6],
+                "suspended": bool(row[7]),
+                "isAdmin": bool(row[8]),
+                "lastLoginTime": row[9].isoformat() if row[9] else None,
+                "syncedAt": row[10].isoformat() if row[10] else None,
+            })
+        return jsonify(result), 200
+    
+    return jsonify(status=404, message="Not Found"), 404
+
+
+@APP.route("/api/<database>/google/users/<userKey>", methods=['GET'])
+def get_google_user(database=None, userKey=None):
+    """GET: /api/<database>/google/users/<userKey>.
+    
+    Get specific synced Google user by email or ID.
+    
+    Response:
+    - 200: {user fields}
+    - 404: {"status": 404, "message": "Not Found"}
+    """
+    database = request.view_args['database']
+    user_key = request.view_args['userKey']
+    
+    sql = (
+        "SELECT id, primary_email, given_name, family_name, external_id, "
+        "department, org_description, suspended, is_admin, last_login_time, synced_at "
+        "FROM " + database + ".google_users "
+        "WHERE primary_email=%s OR external_id=%s LIMIT 1"
+    )
+    
+    row = fetchone_params(sql, (user_key, user_key))
+    
+    if row:
+        return jsonify({
+            "id": row[0],
+            "primaryEmail": row[1],
+            "givenName": row[2],
+            "familyName": row[3],
+            "externalId": row[4],
+            "department": row[5],
+            "orgDescription": row[6],
+            "suspended": bool(row[7]),
+            "isAdmin": bool(row[8]),
+            "lastLoginTime": row[9].isoformat() if row[9] else None,
+            "syncedAt": row[10].isoformat() if row[10] else None,
+        }), 200
+    
+    return jsonify(status=404, message="Not Found"), 404
+
+
+@APP.route("/api/<database>/google/users/<userKey>/photo", methods=['GET'])
+def get_google_user_photo(database=None, userKey=None):
+    """GET: /api/<database>/google/users/<userKey>/photo.
+    
+    Get synced Google user photo by email or ID.
+    Returns image directly with proper MIME type.
+    
+    Response:
+    - 200: Binary image data
+    - 404: {"status": 404, "message": "Not Found"}
+    """
+    database = request.view_args['database']
+    user_key = request.view_args['userKey']
+    
+    # First get user ID from email or ID
+    sql_user = (
+        "SELECT id FROM " + database + ".google_users "
+        "WHERE primary_email=%s OR id=%s LIMIT 1"
+    )
+    user_row = fetchone_params(sql_user, (user_key, user_key))
+    
+    if not user_row:
+        return jsonify(status=404, message="User not found"), 404
+    
+    user_id = user_row[0]
+    
+    # Get photo
+    sql_photo = (
+        "SELECT photo_data, mime_type FROM " + database + ".google_user_photos "
+        "WHERE user_id=%s LIMIT 1"
+    )
+    photo_row = fetchone_params(sql_photo, (user_id,))
+    
+    if photo_row and photo_row[0]:
+        photo_data = photo_row[0]
+        mime_type = photo_row[1] or 'image/jpeg'
+        return send_file(
+            BytesIO(photo_data),
+            mimetype=mime_type,
+            as_attachment=False
+        )
+    
+    return jsonify(status=404, message="Photo not found"), 404
 
 
 @APP.route("/api", methods=['POST'])
@@ -619,6 +859,180 @@ def sql_connection(user=None, password=None):
     }
     _db = mysql.connector.connect(**config)
     return _db
+
+
+def sync_user_to_db(database, user):
+    """Sync Google user data to database.
+    
+    Args:
+        database: Database name
+        user: User dictionary from Google API
+        
+    Returns:
+        Boolean indicating success
+    """
+    try:
+        cnx = sql_connection()
+        cur = cnx.cursor(buffered=True)
+        
+        # Parse last login time
+        last_login = None
+        if user.get('lastLoginTime'):
+            try:
+                # Google format: 2023-11-27T10:30:00.000Z
+                last_login = datetime.fromisoformat(
+                    user['lastLoginTime'].replace('Z', '+00:00')
+                )
+            except (ValueError, AttributeError):
+                pass
+        
+        sql = (
+            "REPLACE INTO " + database + ".google_users "
+            "(id, primary_email, given_name, family_name, external_id, "
+            "department, org_description, suspended, is_admin, last_login_time) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+        )
+        
+        values = (
+            user.get('id'),
+            user.get('primaryEmail'),
+            user.get('givenName'),
+            user.get('familyName'),
+            user.get('externalId'),
+            user.get('department'),
+            user.get('orgDescription'),
+            user.get('suspended', False),
+            user.get('isAdmin', False),
+            last_login
+        )
+        
+        cur.execute(sql, values)
+        cnx.commit()
+        cur.close()
+        cnx.close()
+        return True
+        
+    except Exception as e:
+        print(f"Error syncing user {user.get('primaryEmail')}: {e}")
+        return False
+
+
+def sync_photo_to_db(database, user_id, photo_data, mime_type):
+    """Sync Google user photo to database.
+    
+    Args:
+        database: Database name
+        user_id: Google user ID
+        photo_data: Binary photo data
+        mime_type: Photo MIME type
+        
+    Returns:
+        Boolean indicating success
+    """
+    try:
+        cnx = sql_connection()
+        cur = cnx.cursor(buffered=True)
+        
+        sql = (
+            "REPLACE INTO " + database + ".google_user_photos "
+            "(user_id, photo_data, mime_type) VALUES (%s, %s, %s)"
+        )
+        
+        cur.execute(sql, (user_id, photo_data, mime_type))
+        cnx.commit()
+        cur.close()
+        cnx.close()
+        return True
+        
+    except Exception as e:
+        print(f"Error syncing photo for user {user_id}: {e}")
+        return False
+
+
+def log_sync_start(database, sync_type):
+    """Log the start of a sync operation.
+    
+    Args:
+        database: Database name
+        sync_type: Type of sync ('full', 'user', 'photo')
+        
+    Returns:
+        Log ID
+    """
+    try:
+        cnx = sql_connection()
+        cur = cnx.cursor(buffered=True)
+        
+        sql = (
+            "INSERT INTO " + database + ".google_sync_log "
+            "(sync_type, sync_status) VALUES (%s, %s)"
+        )
+        
+        cur.execute(sql, (sync_type, 'started'))
+        cnx.commit()
+        log_id = cur.lastrowid
+        cur.close()
+        cnx.close()
+        return log_id
+        
+    except Exception as e:
+        print(f"Error logging sync start: {e}")
+        return None
+
+
+def log_sync_complete(database, log_id, users_synced, photos_synced):
+    """Log the completion of a sync operation.
+    
+    Args:
+        database: Database name
+        log_id: Log entry ID
+        users_synced: Number of users synced
+        photos_synced: Number of photos synced
+    """
+    try:
+        cnx = sql_connection()
+        cur = cnx.cursor(buffered=True)
+        
+        sql = (
+            "UPDATE " + database + ".google_sync_log "
+            "SET sync_status=%s, users_synced=%s, photos_synced=%s, "
+            "completed_at=NOW() WHERE id=%s"
+        )
+        
+        cur.execute(sql, ('completed', users_synced, photos_synced, log_id))
+        cnx.commit()
+        cur.close()
+        cnx.close()
+        
+    except Exception as e:
+        print(f"Error logging sync completion: {e}")
+
+
+def log_sync_failed(database, log_id, error_message):
+    """Log a failed sync operation.
+    
+    Args:
+        database: Database name
+        log_id: Log entry ID
+        error_message: Error message
+    """
+    try:
+        cnx = sql_connection()
+        cur = cnx.cursor(buffered=True)
+        
+        sql = (
+            "UPDATE " + database + ".google_sync_log "
+            "SET sync_status=%s, error_message=%s, completed_at=NOW() "
+            "WHERE id=%s"
+        )
+        
+        cur.execute(sql, ('failed', error_message, log_id))
+        cnx.commit()
+        cur.close()
+        cnx.close()
+        
+    except Exception as e:
+        print(f"Error logging sync failure: {e}")
 
 
 def main():
