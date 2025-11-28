@@ -344,14 +344,15 @@ def get_google_user(database=None, userKey=None):
     database = request.view_args['database']
     user_key = request.view_args['userKey']
     
+    # Treat userKey strictly as external_id (Google userID)
     sql = (
         "SELECT id, primary_email, given_name, family_name, external_id, "
         "department, org_description, suspended, is_admin, last_login_time, synced_at "
         "FROM " + database + ".google_users "
-        "WHERE primary_email=%s OR external_id=%s LIMIT 1"
+        "WHERE external_id=%s LIMIT 1"
     )
     
-    row = fetchone_params(sql, (user_key, user_key))
+    row = fetchone_params(sql, (user_key,))
     
     if row:
         return jsonify({
@@ -376,7 +377,16 @@ def get_google_user_photo(database=None, userKey=None):
     """GET: /api/<database>/google/users/<userKey>/photo.
     
     Get synced Google user photo by email or ID.
-    Returns image directly with proper MIME type.
+    Returns either binary image (default) or JSON Data URI when requested.
+    
+    Query Parameters:
+    - source=db|live   (default db) Fetch from DB cache or live Google API
+    - datauri=true     Return JSON with {photoUrl: data:image/...}
+    - format=datauri   Same as datauri=true
+    - raw=1            Force binary response even if datauri requested
+    
+    Response (binary): 200 image bytes
+    Response (JSON Data URI): {"photoUrl": "data:<mime>;base64,....", "mimeType": str, "externalId": str, "source": str}
     
     Response:
     - 200: Binary image data
@@ -384,35 +394,136 @@ def get_google_user_photo(database=None, userKey=None):
     """
     database = request.view_args['database']
     user_key = request.view_args['userKey']
+    source = request.args.get('source', 'db').lower()
+    want_data_uri = request.args.get('datauri', '').lower() in ['1', 'true', 'yes']
+    if request.args.get('format', '').lower() == 'datauri':
+        want_data_uri = True
+    accept_header = request.headers.get('Accept', '')
+    if 'application/json' in accept_header.lower():
+        # Respect explicit JSON Accept preference
+        want_data_uri = True
+    force_raw = request.args.get('raw', '').lower() in ['1', 'true', 'yes'] or request.args.get('format', '').lower() == 'binary'
     
-    # First get user ID from email or ID
+    # If source=live, fetch directly from Google Directory API via backend
+    if source == 'live':
+        if not GOOGLE_AVAILABLE:
+            return jsonify(status=503, message="Google API not configured"), 503
+
+        google_client = create_client_from_env()
+        if not google_client:
+            return jsonify(status=503, message="Google credentials not configured"), 503
+
+        # Resolve primary email using external_id (userKey)
+        sql_email = (
+            "SELECT primary_email FROM " + database + ".google_users "
+            "WHERE external_id=%s LIMIT 1"
+        )
+        email_row = fetchone_params(sql_email, (user_key,))
+        if not email_row:
+            return jsonify(status=404, message="User not found"), 404
+
+        primary_email = email_row[0]
+        # Also get internal numeric id for caching
+        sql_id = (
+            "SELECT id FROM " + database + ".google_users "
+            "WHERE external_id=%s LIMIT 1"
+        )
+        id_row = fetchone_params(sql_id, (user_key,))
+        try:
+            photo_result = google_client.get_user_photo(primary_email)
+            if photo_result:
+                photo_data, mime_type = photo_result
+                # Normalize to raw bytes
+                if isinstance(photo_data, (bytes, bytearray)):
+                    photo_bytes = bytes(photo_data)
+                elif isinstance(photo_data, str):
+                    # Attempt Base64 decode first
+                    try:
+                        padded = photo_data + '=' * ((4 - len(photo_data) % 4) % 4)
+                        photo_bytes = base64.b64decode(padded, validate=False)
+                    except Exception:
+                        photo_bytes = photo_data.encode('utf-8', errors='ignore')
+                else:
+                    photo_bytes = bytes(str(photo_data), 'utf-8', errors='ignore')
+
+                # Sniff mime if absent
+                if not mime_type:
+                    if len(photo_bytes) >= 2 and photo_bytes[0] == 0xFF and photo_bytes[1] == 0xD8:
+                        mime_type = 'image/jpeg'
+                    elif len(photo_bytes) >= 8 and photo_bytes[:8] == b'\x89PNG\r\n\x1a\n':
+                        mime_type = 'image/png'
+                    elif len(photo_bytes) >= 12 and photo_bytes[:4] == b'RIFF' and photo_bytes[8:12] == b'WEBP':
+                        mime_type = 'image/webp'
+                    else:
+                        mime_type = 'application/octet-stream'
+
+                # Cache live photo
+                if id_row and id_row[0]:
+                    try:
+                        sync_photo_to_db(database, id_row[0], photo_bytes, mime_type)
+                    except Exception:
+                        pass
+
+                # Decide representation
+                if want_data_uri and not force_raw:
+                    b64 = base64.b64encode(photo_bytes).decode('ascii')
+                    data_uri = f"data:{mime_type};base64,{b64}"
+                    return jsonify(photoUrl=data_uri,
+                                   mimeType=mime_type,
+                                   externalId=user_key,
+                                   source='live'), 200
+                # Binary fallback
+                return send_file(BytesIO(photo_bytes),
+                                 mimetype=mime_type or 'image/jpeg',
+                                 as_attachment=False)
+            return jsonify(status=404, message="Photo not found"), 404
+        except Exception as e:
+            return jsonify(status=500, message=str(e)), 500
+
+    # Default: serve from synced database
+    # Default DB fetch: resolve by external_id only
     sql_user = (
         "SELECT id FROM " + database + ".google_users "
-        "WHERE primary_email=%s OR id=%s LIMIT 1"
+        "WHERE external_id=%s LIMIT 1"
     )
-    user_row = fetchone_params(sql_user, (user_key, user_key))
-    
+    user_row = fetchone_params(sql_user, (user_key,))
     if not user_row:
         return jsonify(status=404, message="User not found"), 404
-    
+
     user_id = user_row[0]
-    
-    # Get photo
     sql_photo = (
         "SELECT photo_data, mime_type FROM " + database + ".google_user_photos "
         "WHERE user_id=%s LIMIT 1"
     )
     photo_row = fetchone_params(sql_photo, (user_id,))
-    
     if photo_row and photo_row[0]:
         photo_data = photo_row[0]
         mime_type = photo_row[1] or 'image/jpeg'
-        return send_file(
-            BytesIO(photo_data),
-            mimetype=mime_type,
-            as_attachment=False
-        )
-    
+        # Normalize
+        try:
+            if isinstance(photo_data, (bytes, bytearray)):
+                photo_bytes = bytes(photo_data)
+            elif isinstance(photo_data, str):
+                try:
+                    padded = photo_data + '=' * ((4 - len(photo_data) % 4) % 4)
+                    photo_bytes = base64.b64decode(padded, validate=False)
+                except Exception:
+                    photo_bytes = photo_data.encode('utf-8', errors='ignore')
+            else:
+                photo_bytes = bytes(str(photo_data), 'utf-8', errors='ignore')
+        except Exception:
+            return jsonify(status=404, message="Photo decode failed"), 404
+
+        if want_data_uri and not force_raw:
+            b64 = base64.b64encode(photo_bytes).decode('ascii')
+            data_uri = f"data:{mime_type};base64,{b64}"
+            return jsonify(photoUrl=data_uri,
+                           mimeType=mime_type,
+                           externalId=user_key,
+                           source='db'), 200
+
+        return send_file(BytesIO(photo_bytes), mimetype=mime_type, as_attachment=False)
+
     return jsonify(status=404, message="Photo not found"), 404
 
 

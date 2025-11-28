@@ -118,26 +118,36 @@ class GoogleDirectoryClient:
         
         try:
             photo = service.users().photos().get(userKey=user_key).execute()
-            
+
             photo_data_str = photo.get('photoData', '')
             if not photo_data_str:
                 return None
-            
-            # Photo data is base64 encoded, may need padding fix
+
+            # Photo data is Base64 encoded per Directory API
             try:
-                # Add padding if needed
+                # Fix padding if needed
                 missing_padding = len(photo_data_str) % 4
                 if missing_padding:
                     photo_data_str += '=' * (4 - missing_padding)
-                
-                photo_data = base64.b64decode(photo_data_str)
+
+                photo_bytes = base64.b64decode(photo_data_str)
             except Exception as e:
                 print(f'Error decoding photo data for {user_key}: {e}')
                 return None
-            
-            mime_type = photo.get('mimeType', 'image/jpeg')
-            
-            return (photo_data, mime_type)
+
+            # Infer MIME if not provided (Directory may omit mimeType)
+            mime_type = photo.get('mimeType')
+            if not mime_type:
+                if len(photo_bytes) >= 2 and photo_bytes[0] == 0xFF and photo_bytes[1] == 0xD8:
+                    mime_type = 'image/jpeg'
+                elif len(photo_bytes) >= 8 and photo_bytes[:8] == b'\x89PNG\r\n\x1a\n':
+                    mime_type = 'image/png'
+                elif len(photo_bytes) >= 12 and photo_bytes[:4] == b'RIFF' and photo_bytes[8:12] == b'WEBP':
+                    mime_type = 'image/webp'
+                else:
+                    mime_type = 'application/octet-stream'
+
+            return (photo_bytes, mime_type)
             
         except HttpError as error:
             if error.resp.status == 404:
